@@ -3,9 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Efficient Attention Block
-# Paper: Efficient Attention: Attention with Linear Complexities
-# E(Q, K, V) = ρ_q(Q) (ρ_k(K)^T V), where ρ is softmax
+# ============= IMPROVED EFFICIENT ATTENTION BLOCKS =============
+
 class EfficientAttention(nn.Module):
     """
     Efficient Attention mechanism with linear complexity O(n)
@@ -32,15 +31,11 @@ class EfficientAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, num_heads, N, head_dim)
         
         # Apply softmax to Q and K separately (ρ_q and ρ_k)
-        # Shape: (B, num_heads, N, head_dim)
         q_softmax = F.softmax(q, dim=-1)  # ρ_q(Q)
         k_softmax = F.softmax(k, dim=-2)  # ρ_k(K)
         
         # Efficient Attention: E(Q, K, V) = ρ_q(Q) (ρ_k(K)^T V)
-        # Step 1: K^T V -> (B, num_heads, head_dim, head_dim)
         kv = torch.matmul(k_softmax.transpose(-2, -1), v)  # (B, num_heads, head_dim, head_dim)
-        
-        # Step 2: Q (K^T V) -> (B, num_heads, N, head_dim)
         attn = torch.matmul(q_softmax, kv)  # (B, num_heads, N, head_dim)
         
         # Reshape and project
@@ -48,6 +43,37 @@ class EfficientAttention(nn.Module):
         x = self.proj(attn)
         x = self.proj_drop(x)
         
+        return x
+
+
+class AttentionBlock(nn.Module):
+    """
+    Attention Block with LayerNorm, Residual Connection, and MLP
+    Improved integration for classification tasks
+    """
+    def __init__(self, dim, num_heads=8, mlp_ratio=4., qkv_bias=False, 
+                 drop=0., attn_drop=0., act_layer=nn.GELU):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = EfficientAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
+                                       attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = nn.LayerNorm(dim)
+        
+        # MLP feedforward
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            act_layer(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop),
+        )
+
+    def forward(self, x):
+        # Self-attention with residual
+        x = x + self.attn(self.norm1(x))
+        # MLP with residual
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -82,7 +108,13 @@ class Bottleneck(nn.Module):
         return out
 
 class EA_ResNet50(nn.Module):
-    def __init__(self, num_classes=1000):
+    """
+    Improved EA_ResNet50 with:
+    - Multi-scale attention blocks (layer2 and layer3)
+    - Improved attention with LayerNorm, Residual Connection, and MLP
+    - Better integration with ResNet architecture for classification
+    """
+    def __init__(self, num_classes=1000, num_heads=8, attn_drop=0.1):
         super(EA_ResNet50, self).__init__()
         self.in_channels = 64
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -91,9 +123,18 @@ class EA_ResNet50(nn.Module):
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
         self.layer1 = self._make_layer(Bottleneck, 64, 3, stride=1)
+        
+        # Layer2 with attention (512 channels = 128*4)
         self.layer2 = self._make_layer(Bottleneck, 128, 4, stride=2)
+        self.attn_layer2 = AttentionBlock(dim=512, num_heads=num_heads, 
+                                          attn_drop=attn_drop, drop=0.1)
+        
+        # Layer3 with attention (1024 channels = 256*4)
         self.layer3 = self._make_layer(Bottleneck, 256, 6, stride=2)
-        self.efficient_attn = EfficientAttention(dim=1024, num_heads=8)  # 256 * 4 = 1024
+        self.attn_layer3 = AttentionBlock(dim=1024, num_heads=num_heads, 
+                                          attn_drop=attn_drop, drop=0.1)
+        
+        # Layer4 without attention
         self.layer4 = self._make_layer(Bottleneck, 512, 3, stride=2)
         
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
@@ -118,15 +159,22 @@ class EA_ResNet50(nn.Module):
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)  # (B, 64, 56, 56)
-        x = self.layer1(x)  # (B, 256, 56, 56)
-        x = self.layer2(x)  # (B, 512, 28, 28)
-        x = self.layer3(x)  # (B, 1024, 14, 14)
         
-        # Apply EfficientAttention
+        x = self.layer1(x)  # (B, 256, 56, 56)
+        
+        # Layer2 + Attention
+        x = self.layer2(x)  # (B, 512, 28, 28)
         B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, H*W, C) = (B, 196, 1024)
-        x = self.efficient_attn(x)  # (B, 196, 1024)
-        x = x.transpose(1, 2).reshape(B, C, H, W)  # Back to (B, 1024, 14, 14)
+        x_attn = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        x_attn = self.attn_layer2(x_attn)
+        x = x_attn.transpose(1, 2).reshape(B, C, H, W)  # (B, 512, 28, 28)
+        
+        # Layer3 + Attention
+        x = self.layer3(x)  # (B, 1024, 14, 14)
+        B, C, H, W = x.shape
+        x_attn = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        x_attn = self.attn_layer3(x_attn)
+        x = x_attn.transpose(1, 2).reshape(B, C, H, W)  # (B, 1024, 14, 14)
         
         x = self.layer4(x)  # (B, 2048, 7, 7)
         x = self.avgpool(x)  # (B, 2048, 1, 1)
